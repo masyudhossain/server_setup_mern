@@ -252,22 +252,64 @@ ufw status verbose
 
 section "8/11 - Configuring Fail2ban"
 
+# Install Fail2ban and the systemd journal integration.
+apt-get install -y fail2ban python3-systemd
+
 mkdir -p /etc/fail2ban/jail.d
 
+# Configure SSH protection using systemd journal logs.
 cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
 enabled = true
+backend = systemd
 maxretry = 3
 findtime = 10m
 bantime = 1d
 EOF
 
-fail2ban-client -t || die "Fail2ban configuration test failed."
+# Validate configuration before starting the daemon.
+if ! fail2ban-client -t; then
+    die "Fail2ban configuration test failed."
+fi
 
-systemctl enable --now fail2ban
-systemctl restart fail2ban
+# Enable the service at boot and clear any previous failed state.
+systemctl enable fail2ban
+systemctl reset-failed fail2ban || true
 
-fail2ban-client status sshd
+# Restart the daemon and show useful logs if startup fails.
+if ! systemctl restart fail2ban; then
+    echo
+    warn "Fail2ban failed to restart. Recent service logs:"
+    journalctl -u fail2ban -n 60 --no-pager || true
+    die "Fail2ban could not start. Fix the service error before continuing."
+fi
+
+# Wait for the service to become active.
+for attempt in {1..10}; do
+    if systemctl is-active --quiet fail2ban; then
+        break
+    fi
+    sleep 1
+done
+
+if ! systemctl is-active --quiet fail2ban; then
+    journalctl -u fail2ban -n 60 --no-pager || true
+    die "Fail2ban is not active. See the service logs above."
+fi
+
+# Verify that the client can communicate with the daemon.
+if ! fail2ban-client ping; then
+    journalctl -u fail2ban -n 60 --no-pager || true
+    die "Fail2ban daemon is active but its socket is not responding."
+fi
+
+# Verify that SSH protection is enabled.
+if ! fail2ban-client status sshd; then
+    journalctl -u fail2ban -n 60 --no-pager || true
+    die "Fail2ban is running, but the SSH jail is not operational."
+fi
+
+log "Fail2ban started successfully; SSH jail is active."
 
 # -------------------- 9. Automatic Updates --------------
 
