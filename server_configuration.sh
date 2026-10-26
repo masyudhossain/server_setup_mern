@@ -1,294 +1,364 @@
-#!/bin/bash
 
-set -e
+#!/usr/bin/env bash
+# Server Provisioning Script V4.1.0
+# Target: Ubuntu 26.04 LTS x86_64
+# Installs: Node.js 24 LTS, latest npm, Bun, PM2, NGINX,
+# UFW, Fail2ban, unattended upgrades, Certbot and Croc.
 
-# ─── Color & Style Codes ───
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-CYAN="\e[36m"
-WHITE="\e[97m"
-DIM="\e[2m"
-BOLD="\e[1m"
-RESET="\e[0m"
-BG_GREEN="\e[42m"
-BG_CYAN="\e[46m"
-BG_RED="\e[41m"
+set -Eeuo pipefail
+umask 027
 
-CHECKMARK="${GREEN}✔${RESET}"
-ARROW="${CYAN}▶${RESET}"
-ROCKET="${YELLOW}🚀${RESET}"
-GEAR="${CYAN}⚙${RESET}"
-SHIELD="${GREEN}🛡${RESET}"
-LOCK="${YELLOW}🔒${RESET}"
-PACKAGE="${CYAN}📦${RESET}"
+export DEBIAN_FRONTEND=noninteractive
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-TOTAL_STEPS=11
-START_TIME=$(date +%s)
+# -------------------- Configuration --------------------
 
-# ─── Versions ───
-NODE_VERSION="v24.21.0"
-NODE_DISTRO="linux-x64"
+NODE_MAJOR=24
+BACKUP_DIR="/root/server-setup-backups/$(date +%Y%m%d-%H%M%S)"
+TMP_DIR="$(mktemp -d)"
 
-# ─── Helper Functions ───
-line() {
-    echo -e "${DIM}${CYAN}──────────────────────────────────────────────────${RESET}"
+# -------------------- Logging --------------------------
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[INFO]${NC} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+}
+
+die() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    exit 1
 }
 
 section() {
-    local step=$1
-    local title=$2
-    local icon=$3
-
-    echo ""
-    line
-    echo -e "  ${icon}  ${BOLD}${WHITE}[${step}/${TOTAL_STEPS}]${RESET}  ${BOLD}${CYAN}${title}${RESET}"
-    line
+    echo
+    echo -e "${BLUE}==================================================${NC}"
+    echo -e "${BLUE} $*${NC}"
+    echo -e "${BLUE}==================================================${NC}"
 }
 
-success() {
-    echo -e "  ${CHECKMARK}  ${GREEN}$1${RESET}"
+cleanup() {
+    rm -rf -- "$TMP_DIR"
 }
 
-info() {
-    echo -e "  ${DIM}${WHITE}$1${RESET}"
-}
+trap cleanup EXIT
 
-elapsed() {
-    local now=$(date +%s)
-    local diff=$((now - START_TIME))
-    local min=$((diff / 60))
-    local sec=$((diff % 60))
+# -------------------- Preflight ------------------------
 
-    echo -e "  ${DIM}⏱  Elapsed: ${min}m ${sec}s${RESET}"
-}
+[[ $EUID -eq 0 ]] || die "Run this script as root: sudo bash setup.sh"
 
-# ─── Banner ───
-clear
+[[ -r /etc/os-release ]] || die "Cannot identify the operating system."
+# shellcheck disable=SC1091
+source /etc/os-release
 
-echo ""
-echo -e "${BOLD}${CYAN}"
-echo "  ┌──────────────────────────────────────────────┐"
-echo "  │                                              │"
-echo -e "  │   ${WHITE} SERVER SETUP (V3.0.0) ${CYAN}                    │"
-echo "  │    Server Configuration Script               │"
-echo "  │                                              │"
-echo -e "  │   ${DIM}Date : $(date '+%B %d, %Y  %H:%M %Z')${CYAN}        │"
-echo -e "  │   ${DIM}Host : $(hostname)${CYAN}                           │"
-echo "  │                                              │"
-echo "  └──────────────────────────────────────────────┘"
-echo -e "${RESET}"
-echo ""
+[[ "${ID:-}" == "ubuntu" ]] || die "This script supports Ubuntu only."
+[[ "${VERSION_ID:-}" == "26.04" ]] ||
+    die "Expected Ubuntu 26.04; detected ${VERSION_ID:-unknown}."
 
-# ─── [1/11] Update & Upgrade ───
-section 1 "Updating & Upgrading System" "${GEAR}"
+[[ "$(dpkg --print-architecture)" == "amd64" ]] ||
+    die "This script currently supports amd64/x86_64 only."
 
-sudo apt update -y
-sudo apt upgrade -y
+command -v systemctl >/dev/null 2>&1 ||
+    die "systemd is required."
 
-success "System updated and upgraded"
-elapsed
+if [[ -d /var/www ]]; then
+    warn "/var/www exists. Existing applications will not be intentionally removed."
+fi
 
+echo
+echo "This script will install or update system packages and security settings."
+echo "Use it on a fresh server. Review the script before executing it."
+echo
+read -r -p "Type YES to continue: " CONFIRM
+[[ "$CONFIRM" == "YES" ]] || die "Cancelled."
 
-# ─── [2/11] Install Utilities ───
-section 2 "Installing Core Utilities" "${PACKAGE}"
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
-sudo apt install -y \
+# -------------------- 1. System Update ------------------
+
+section "1/11 - Updating Ubuntu"
+
+apt-get update
+apt-get upgrade -y
+apt-get install -y \
+    ca-certificates \
     curl \
     wget \
+    gnupg \
+    jq \
     git \
-    ufw \
-    fail2ban \
-    software-properties-common \
-    btop \
     unzip \
     xz-utils \
-    ca-certificates
+    tar \
+    ufw \
+    fail2ban \
+    openssh-server \
+    software-properties-common \
+    btop \
+    unattended-upgrades \
+    apt-transport-https
 
-success "Core utilities installed"
-info "Installed: curl, wget, git, ufw, fail2ban, btop, unzip, xz-utils"
-elapsed
+# -------------------- 2. Node.js ------------------------
 
+section "2/11 - Installing Node.js ${NODE_MAJOR} LTS"
 
-# ─── [3/11] Install Node.js ───
-section 3 "Installing Node.js LTS ${NODE_VERSION}" "${PACKAGE}"
+# Determine the latest published Node.js 24.x release.
+NODE_VERSION="$(
+    curl -fsSL https://nodejs.org/dist/index.json |
+    jq -er '
+        [.[] | select(.version | test("^v24\\."))][0].version
+    '
+)"
 
-cd /tmp
+[[ "$NODE_VERSION" =~ ^v24\.[0-9]+\.[0-9]+$ ]] ||
+    die "Could not determine a valid Node.js 24 release."
 
-NODE_ARCHIVE="node-${NODE_VERSION}-${NODE_DISTRO}.tar.xz"
+NODE_ARCHIVE="node-${NODE_VERSION}-linux-x64.tar.xz"
 NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_ARCHIVE}"
 
-echo -e "  ${ARROW} Downloading ${NODE_ARCHIVE}"
+log "Selected Node.js ${NODE_VERSION}"
 
-wget -q --show-progress "${NODE_URL}" -O "${NODE_ARCHIVE}"
+# Back up existing executables and global npm packages, if present.
+for path in \
+    /usr/local/bin/node \
+    /usr/local/bin/npm \
+    /usr/local/bin/npx \
+    /usr/local/bin/corepack \
+    /usr/local/lib/node_modules
+do
+    if [[ -e "$path" || -L "$path" ]]; then
+        cp -a --parents "$path" "$BACKUP_DIR/"
+    fi
+done
 
-echo -e "  ${ARROW} Installing Node.js to /usr/local"
+curl -fsSL "$NODE_URL" -o "$TMP_DIR/$NODE_ARCHIVE"
+curl -fsSL \
+    "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" \
+    -o "$TMP_DIR/SHASUMS256.txt"
 
-sudo tar -xJf "${NODE_ARCHIVE}" \
+(
+    cd "$TMP_DIR"
+    grep -F "  ${NODE_ARCHIVE}" SHASUMS256.txt |
+        sha256sum --check -
+) || die "Node.js checksum verification failed."
+
+tar -xJf "$TMP_DIR/$NODE_ARCHIVE" \
     -C /usr/local \
-    --strip-components=1
+    --strip-components=1 \
+    --no-same-owner
 
-rm -f "${NODE_ARCHIVE}"
+hash -r
 
-success "Node.js installed  →  $(node -v)"
-info "NPM version        →  $(npm -v)"
-info "Node path          →  $(which node)"
-info "NPM path           →  $(which npm)"
-elapsed
+node --version
+npm --version
 
+# -------------------- 3. Latest npm ---------------------
 
-# ─── [4/11] Install Bun ───
-section 4 "Installing Bun JavaScript Runtime" "${PACKAGE}"
+section "3/11 - Installing latest stable npm"
 
-echo -e "  ${ARROW} Installing latest stable Bun"
+# Node.js bundles npm, but the bundled version may not be the latest.
+# Update npm separately, then verify that it works.
+npm install --global npm@latest
 
-# Bun official installer
-curl -fsSL https://bun.com/install | bash
+hash -r
 
-# Make Bun available for the current script/session
-export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+log "Node.js: $(node --version)"
+log "npm:     $(npm --version)"
+
+npm --version >/dev/null ||
+    die "npm verification failed."
+
+# -------------------- 4. Bun ----------------------------
+
+section "4/11 - Installing or updating Bun"
+
+export BUN_INSTALL="/root/.bun"
+export PATH="${BUN_INSTALL}/bin:${PATH}"
+
+# Use the official Bun installer, which installs or updates Bun.
+curl -fsSL https://bun.sh/install -o "$TMP_DIR/bun-install.sh"
+bash "$TMP_DIR/bun-install.sh"
+
+[[ -x "${BUN_INSTALL}/bin/bun" ]] ||
+    die "Bun binary was not found after installation."
+
+# Make Bun available to future root login shells.
+touch /root/.bashrc
+if ! grep -Fq 'export BUN_INSTALL="$HOME/.bun"' /root/.bashrc; then
+    cat >> /root/.bashrc <<'EOF'
+
+# Bun
+export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
-
-# Ensure Bun is available for future bash sessions
-if [ -f "$HOME/.bashrc" ]; then
-    grep -qxF 'export BUN_INSTALL="$HOME/.bun"' "$HOME/.bashrc" || \
-        echo 'export BUN_INSTALL="$HOME/.bun"' >> "$HOME/.bashrc"
-
-    grep -qxF 'export PATH="$BUN_INSTALL/bin:$PATH"' "$HOME/.bashrc" || \
-        echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> "$HOME/.bashrc"
+EOF
 fi
 
-if command -v bun >/dev/null 2>&1; then
-    success "Bun installed  →  $(bun --version)"
-    info "Bun path          →  $(which bun)"
-else
-    echo -e "  ${RED}✖ Bun installation failed${RESET}"
-    exit 1
-fi
+log "Bun: $("${BUN_INSTALL}/bin/bun" --version)"
 
-elapsed
+# -------------------- 5. PM2 ----------------------------
 
+section "5/11 - Installing latest stable PM2"
 
-# ─── [5/11] Install PM2 ───
-section 5 "Installing PM2 Process Manager" "${GEAR}"
+npm install --global pm2@latest
 
-sudo npm install -g pm2
+command -v pm2 >/dev/null 2>&1 ||
+    die "PM2 installation failed."
 
-sudo pm2 startup systemd --silent
+log "PM2: $(pm2 --version)"
 
-success "PM2 installed and startup configured"
-info "PM2 version       →  $(pm2 -v)"
-elapsed
+# Configure PM2 to start at boot for root.
+pm2 startup systemd -u root --hp /root
 
+systemctl daemon-reload
 
-# ─── [6/11] Install NGINX ───
-section 6 "Installing NGINX Web Server" "${PACKAGE}"
+# No application processes are started by this script.
 
-sudo apt install -y nginx
+# -------------------- 6. NGINX --------------------------
 
-sudo systemctl enable nginx
-sudo systemctl start nginx
+section "6/11 - Installing NGINX"
 
-success "NGINX installed and enabled"
-info "$(nginx -v 2>&1)"
-elapsed
+# Use Ubuntu's own repository for Ubuntu 26.04 compatibility.
+# This installs the latest NGINX package available from the
+# configured Ubuntu repositories, not necessarily upstream mainline.
+apt-get install -y nginx
 
+nginx -t || die "NGINX configuration test failed."
 
-# ─── [7/11] Firewall Configuration ───
-section 7 "Configuring UFW Firewall" "${SHIELD}"
+systemctl enable --now nginx
 
-sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
+log "NGINX: $(nginx -v 2>&1)"
 
-sudo ufw --force enable
+# -------------------- 7. Firewall -----------------------
 
-success "Firewall active — OpenSSH & Nginx Full allowed"
-elapsed
+section "7/11 - Configuring UFW"
 
+# Keep SSH access open before enabling the firewall.
+ufw allow OpenSSH
+ufw allow 'Nginx Full'
 
-# ─── [8/11] Fail2ban ───
-section 8 "Configuring Fail2ban" "${SHIELD}"
+ufw --force enable
+ufw status verbose
 
-sudo systemctl enable fail2ban
-sudo systemctl start fail2ban
+# -------------------- 8. Fail2ban -----------------------
 
-success "Fail2ban enabled and running"
-elapsed
+section "8/11 - Configuring Fail2ban"
 
+mkdir -p /etc/fail2ban/jail.d
 
-# ─── [9/11] Unattended Upgrades ───
-section 9 "Enabling Unattended Upgrades" "${GEAR}"
+cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+maxretry = 3
+findtime = 10m
+bantime = 1d
+EOF
 
-sudo apt install -y unattended-upgrades
+fail2ban-client -t || die "Fail2ban configuration test failed."
 
-echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' \
-    | sudo debconf-set-selections
+systemctl enable --now fail2ban
+systemctl restart fail2ban
 
-sudo DEBIAN_FRONTEND=noninteractive \
-    dpkg-reconfigure -plow unattended-upgrades
+fail2ban-client status sshd
 
-success "Unattended upgrades configured"
-elapsed
+# -------------------- 9. Automatic Updates --------------
 
+section "9/11 - Configuring unattended security updates"
 
-# ─── [10/11] Certbot ───
-section 10 "Installing Certbot for SSL" "${LOCK}"
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
 
-sudo apt install -y \
-    certbot \
-    python3-certbot-nginx
+systemctl enable --now unattended-upgrades.service ||
+    warn "Could not enable unattended-upgrades.service; verify its configuration."
 
-success "Certbot installed — ready for SSL certificates"
-info "$(certbot --version 2>&1)"
-elapsed
+# -------------------- 10. Certbot -----------------------
 
+section "10/11 - Installing Certbot"
 
-# ─── [11/11] Install Croc ───
-section 11 "Installing Croc (File Transfer)" "${PACKAGE}"
+apt-get install -y certbot python3-certbot-nginx
 
-curl https://getcroc.schollz.com | bash
+certbot --version
 
-success "Croc installed"
-info "$(croc --version 2>&1)"
-elapsed
+# -------------------- 11. Croc --------------------------
 
+section "11/11 - Installing latest Croc release"
 
-# ─── Final Summary ───
-END_TIME=$(date +%s)
+CROC_RELEASE="$(
+    curl -fsSL https://api.github.com/repos/schollz/croc/releases/latest
+)"
 
-DURATION=$((END_TIME - START_TIME))
-DURATION_MIN=$((DURATION / 60))
-DURATION_SEC=$((DURATION % 60))
+CROC_ASSET="$(
+    jq -er '
+        [
+            .assets[]
+            | select(.name | test("_amd64\\.deb$"))
+            | {name: .name, url: .browser_download_url, digest: .digest}
+        ][0]
+        | [.name, .url, (.digest // "")]
+        | @tsv
+    ' <<< "$CROC_RELEASE"
+)" || die "Could not find a Croc amd64 Debian package."
 
-echo ""
-echo ""
+IFS=$'\t' read -r CROC_NAME CROC_URL CROC_DIGEST <<< "$CROC_ASSET"
 
-echo -e "${BOLD}${GREEN}"
-echo "  ┌──────────────────────────────────────────────┐"
-echo "  │                                              │"
-echo -e "  │   ${WHITE}✅  SERVER SETUP COMPLETE${GREEN}                  │"
-echo "  │                                              │"
-echo "  └──────────────────────────────────────────────┘"
-echo -e "${RESET}"
+[[ "$CROC_URL" == https://github.com/schollz/croc/releases/download/* ]] ||
+    die "Unexpected Croc download URL."
 
-echo ""
-echo -e "  ${BOLD}${WHITE}Installed Components${RESET}"
+[[ "$CROC_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]] ||
+    die "GitHub did not provide a usable SHA-256 digest for Croc."
 
-line
+curl -fsSL "$CROC_URL" -o "$TMP_DIR/$CROC_NAME"
 
-echo -e "  ${CHECKMARK}  ${WHITE}Node.js    ${DIM}→${RESET}  $(node -v)"
-echo -e "  ${CHECKMARK}  ${WHITE}NPM        ${DIM}→${RESET}  $(npm -v)"
-echo -e "  ${CHECKMARK}  ${WHITE}Bun        ${DIM}→${RESET}  $(bun --version)"
-echo -e "  ${CHECKMARK}  ${WHITE}PM2        ${DIM}→${RESET}  $(pm2 -v)"
-echo -e "  ${CHECKMARK}  ${WHITE}NGINX      ${DIM}→${RESET}  $(nginx -v 2>&1)"
-echo -e "  ${CHECKMARK}  ${WHITE}Certbot    ${DIM}→${RESET}  $(certbot --version 2>&1)"
-echo -e "  ${CHECKMARK}  ${WHITE}Croc       ${DIM}→${RESET}  $(croc --version 2>&1)"
-echo -e "  ${CHECKMARK}  ${WHITE}Firewall   ${DIM}→${RESET}  UFW Active"
-echo -e "  ${CHECKMARK}  ${WHITE}Fail2ban   ${DIM}→${RESET}  Running"
+EXPECTED_SHA="${CROC_DIGEST#sha256:}"
+ACTUAL_SHA="$(sha256sum "$TMP_DIR/$CROC_NAME" | awk '{print $1}')"
 
-line
+[[ "${ACTUAL_SHA,,}" == "${EXPECTED_SHA,,}" ]] ||
+    die "Croc checksum verification failed."
 
-echo ""
-echo -e "  ${DIM}⏱  Total time: ${DURATION_MIN}m ${DURATION_SEC}s${RESET}"
-echo -e "  ${DIM}📅  Completed: $(date '+%B %d, %Y at %H:%M %Z')${RESET}"
-echo ""
+apt-get install -y "$TMP_DIR/$CROC_NAME"
+
+log "Croc: $(croc --version 2>&1 | head -n 1)"
+
+# -------------------- Final Verification ----------------
+
+section "Installation Summary"
+
+echo
+echo "Operating System : $(. /etc/os-release && echo "$PRETTY_NAME")"
+echo "Architecture     : $(dpkg --print-architecture)"
+echo "Node.js          : $(node --version)"
+echo "npm              : $(npm --version)"
+echo "Bun              : $(bun --version)"
+echo "PM2              : $(pm2 --version)"
+echo "NGINX            : $(nginx -v 2>&1)"
+echo "Certbot          : $(certbot --version 2>&1)"
+echo "Croc             : $(croc --version 2>&1 | head -n 1)"
+echo
+echo "NGINX status:"
+systemctl is-active nginx || true
+
+echo
+echo "Fail2ban status:"
+systemctl is-active fail2ban || true
+
+echo
+echo "PM2 process list:"
+pm2 list
+
+echo
+echo "Backup directory: $BACKUP_DIR"
+echo
+warn "Before production use, verify SSH access, firewall rules, DNS, TLS, backups and monitoring."
+warn "Review UFW rules if your server uses custom SSH, application, database or monitoring ports."
+
+section "Provisioning Complete"
