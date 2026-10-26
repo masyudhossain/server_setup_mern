@@ -1,7 +1,7 @@
 
 #!/usr/bin/env bash
-# Server Provisioning Script V4.1.0
-# Target: Ubuntu 26.04 LTS x86_64
+# Server Provisioning Script V4.2.0
+# Target: Ubuntu 24.04 / 26.04 LTS x86_64
 # Installs: Node.js 24 LTS, latest npm, Bun, PM2, NGINX,
 # UFW, Fail2ban, unattended upgrades, Certbot and Croc.
 
@@ -60,8 +60,10 @@ trap cleanup EXIT
 source /etc/os-release
 
 [[ "${ID:-}" == "ubuntu" ]] || die "This script supports Ubuntu only."
-[[ "${VERSION_ID:-}" == "26.04" ]] ||
-    die "Expected Ubuntu 26.04; detected ${VERSION_ID:-unknown}."
+case "${VERSION_ID:-}" in
+    24.04|26.04) ;;
+    *) die "Supported Ubuntu versions: 24.04 and 26.04; detected ${VERSION_ID:-unknown}." ;;
+esac
 
 [[ "$(dpkg --print-architecture)" == "amd64" ]] ||
     die "This script currently supports amd64/x86_64 only."
@@ -260,12 +262,11 @@ ufw status verbose
 
 section "8/11 - Configuring Fail2ban"
 
-# Install Fail2ban and the systemd journal integration.
 apt-get install -y fail2ban python3-systemd
 
 mkdir -p /etc/fail2ban/jail.d
 
-# Configure SSH protection using systemd journal logs.
+# Use the systemd journal for SSH authentication logs.
 cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
 enabled = true
@@ -275,45 +276,40 @@ findtime = 10m
 bantime = 1d
 EOF
 
-# Validate configuration before starting the daemon.
-if ! fail2ban-client -t; then
+fail2ban-client -t ||
     die "Fail2ban configuration test failed."
-fi
 
-# Enable the service at boot and clear any previous failed state.
 systemctl enable fail2ban
 systemctl reset-failed fail2ban || true
 
-# Restart the daemon and show useful logs if startup fails.
+# Restart Fail2ban, then wait for its client socket to become responsive.
+# systemctl is-active alone is not sufficient: the daemon can be active
+# briefly before fail2ban.sock is ready.
 if ! systemctl restart fail2ban; then
-    echo
     warn "Fail2ban failed to restart. Recent service logs:"
-    journalctl -u fail2ban -n 60 --no-pager || true
+    journalctl -u fail2ban -n 80 --no-pager || true
     die "Fail2ban could not start. Fix the service error before continuing."
 fi
 
-# Wait for the service to become active.
-for attempt in {1..10}; do
-    if systemctl is-active --quiet fail2ban; then
+FAIL2BAN_READY=false
+for attempt in {1..20}; do
+    if systemctl is-active --quiet fail2ban &&
+       fail2ban-client ping >/dev/null 2>&1; then
+        FAIL2BAN_READY=true
         break
     fi
     sleep 1
 done
 
-if ! systemctl is-active --quiet fail2ban; then
-    journalctl -u fail2ban -n 60 --no-pager || true
-    die "Fail2ban is not active. See the service logs above."
+if [[ "$FAIL2BAN_READY" != "true" ]]; then
+    warn "Fail2ban did not become responsive. Recent service logs:"
+    systemctl status fail2ban --no-pager -l || true
+    journalctl -u fail2ban -n 80 --no-pager || true
+    die "Fail2ban is not responding after 20 seconds."
 fi
 
-# Verify that the client can communicate with the daemon.
-if ! fail2ban-client ping; then
-    journalctl -u fail2ban -n 60 --no-pager || true
-    die "Fail2ban daemon is active but its socket is not responding."
-fi
-
-# Verify that SSH protection is enabled.
 if ! fail2ban-client status sshd; then
-    journalctl -u fail2ban -n 60 --no-pager || true
+    journalctl -u fail2ban -n 80 --no-pager || true
     die "Fail2ban is running, but the SSH jail is not operational."
 fi
 
@@ -388,7 +384,7 @@ echo "Operating System : $(. /etc/os-release && echo "$PRETTY_NAME")"
 echo "Architecture     : $(dpkg --print-architecture)"
 echo "Node.js          : $(node --version)"
 echo "npm              : $(npm --version)"
-echo "Bun              : $(bun --version)"
+echo "Bun              : $(/root/.bun/bin/bun --version)"
 echo "PM2              : $(pm2 --version)"
 echo "NGINX            : $(nginx -v 2>&1)"
 echo "Certbot          : $(certbot --version 2>&1)"
