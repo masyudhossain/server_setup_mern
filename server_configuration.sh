@@ -177,6 +177,7 @@ log "npm:     $(npm --version)"
 npm --version >/dev/null ||
     die "npm verification failed."
 
+
 # -------------------- 4. Bun ----------------------------
 
 section "4/11 - Installing or updating Bun"
@@ -184,25 +185,32 @@ section "4/11 - Installing or updating Bun"
 export BUN_INSTALL="/root/.bun"
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
-# Use the official Bun installer, which installs or updates Bun.
+# Install or update Bun using the official installer.
 curl -fsSL https://bun.sh/install -o "$TMP_DIR/bun-install.sh"
 bash "$TMP_DIR/bun-install.sh"
 
-[[ -x "${BUN_INSTALL}/bin/bun" ]] ||
+BUN_BIN="/root/.bun/bin/bun"
+
+[[ -x "$BUN_BIN" ]] ||
     die "Bun binary was not found after installation."
 
-# Make Bun available to future root login shells.
-touch /root/.bashrc
-if ! grep -Fq 'export BUN_INSTALL="$HOME/.bun"' /root/.bashrc; then
-    cat >> /root/.bashrc <<'EOF'
+# Make Bun available in future root Bash sessions.
+for PROFILE_FILE in /root/.bashrc /root/.profile; do
+    touch "$PROFILE_FILE"
 
-# Bun
+    if ! grep -Fq '# Bun PATH configuration' "$PROFILE_FILE"; then
+        cat >> "$PROFILE_FILE" <<'EOF'
+
+# Bun PATH configuration
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 EOF
-fi
+    fi
+done
 
-log "Bun: $("${BUN_INSTALL}/bin/bun" --version)"
+# Verify the binary directly, independently of shell configuration.
+log "Bun: $("$BUN_BIN" --version)"
+
 
 # -------------------- 5. PM2 ----------------------------
 
